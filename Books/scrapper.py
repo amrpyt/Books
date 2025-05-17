@@ -6,21 +6,17 @@ A script to extract the full content of Arabic books from ketabonline.com
 
 import asyncio
 import re
-import sys
 import os
 from pathlib import Path
-from playwright.async_api import async_playwright
-import argparse
-from datetime import datetime
-from tqdm import tqdm  # For progress bar
-import time
-import requests
+import aiohttp
 from bs4 import BeautifulSoup
+from tqdm import tqdm
+import time
 
 class KetabOnlineExtractor:
     """Main class for extracting books from ketabonline.com"""
     
-    def __init__(self, book_id, book_name, max_retries=3, delay=1):
+    def __init__(self, book_id, book_name, max_retries=3, delay=0.1, concurrency=10):
         """
         Initialize the extractor with book information
         
@@ -29,56 +25,59 @@ class KetabOnlineExtractor:
             book_name (str): The name of the book for the output file
             max_retries (int): Maximum number of retry attempts for failed requests
             delay (float): Delay between requests to avoid rate limiting
+            concurrency (int): Maximum number of concurrent requests
         """
         self.base_url = f"https://ketabonline.com/ar/books/{book_id}/read"
         self.book_id = book_id
         self.book_name = book_name
         self.max_retries = max_retries
         self.delay = delay
-        self.session = requests.Session()
-        self.session.headers.update({
+        self.concurrency = concurrency
+        self.semaphore = asyncio.Semaphore(concurrency)
+        self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        })
+        }
         self.total_pages = 0
         
-    def get_page(self, page_number, part=1):
+    async def get_page(self, session, page_number, part=1):
         """
-        Get the content of a specific page
+        Get the content of a specific page asynchronously
         
         Args:
+            session (aiohttp.ClientSession): The aiohttp session
             page_number (int): The page number to extract
             part (int): The part number (default: 1)
             
         Returns:
-            str or None: The page content or None if failed
+            tuple: (page_number, html_content) or (page_number, None) if failed
         """
         url = f"{self.base_url}?part={part}&page={page_number}"
         
-        for attempt in range(self.max_retries):
-            try:
-                response = self.session.get(url, timeout=10)
-                
-                if response.status_code == 200:
-                    return response.text
+        async with self.semaphore:  # Limit concurrency
+            for attempt in range(self.max_retries):
+                try:
+                    async with session.get(url, timeout=10) as response:
+                        if response.status == 200:
+                            return page_number, await response.text()
+                        
+                    print(f"Error {response.status} for page {page_number}. Retrying ({attempt+1}/{self.max_retries})...")
+                    await asyncio.sleep(self.delay * (attempt + 1))  # Exponential backoff
                     
-                print(f"Error {response.status_code} for page {page_number}. Retrying ({attempt+1}/{self.max_retries})...")
-                time.sleep(self.delay * (attempt + 1))  # Exponential backoff
-                
-            except requests.RequestException as e:
-                print(f"Request error for page {page_number}: {e}. Retrying ({attempt+1}/{self.max_retries})...")
-                time.sleep(self.delay * (attempt + 1))
-        
-        print(f"Failed to get page {page_number} after {self.max_retries} attempts.")
-        return None
+                except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                    print(f"Request error for page {page_number}: {e}. Retrying ({attempt+1}/{self.max_retries})...")
+                    await asyncio.sleep(self.delay * (attempt + 1))
+            
+            print(f"Failed to get page {page_number} after {self.max_retries} attempts.")
+            return page_number, None
     
-    def get_total_pages(self):
+    async def get_total_pages(self, session):
         """
-        Get the total number of pages in the book
+        Get the total number of pages in the book asynchronously
         
         Returns:
             int: Total number of pages
         """
-        html = self.get_page(1)
+        _, html = await self.get_page(session, 1)
         if not html:
             raise Exception("Cannot retrieve first page to determine total pages")
             
@@ -193,32 +192,39 @@ class KetabOnlineExtractor:
         
         return "\n\n".join(content) if content else ""
     
-    def extract_book(self):
+    async def extract_book(self):
         """
-        Extract the complete book content
+        Extract the complete book content asynchronously
         
         Returns:
             str: The complete book content
         """
         try:
-            self.total_pages = self.get_total_pages()
-            print(f"Book has {self.total_pages} pages.")
-            
-            all_content = []
-            for page in tqdm(range(1, self.total_pages + 1), desc="Extracting pages"):
-                html = self.get_page(page)
-                content = self.extract_content_from_html(html)
+            async with aiohttp.ClientSession(headers=self.headers) as session:
+                self.total_pages = await self.get_total_pages(session)
+                print(f"Book has {self.total_pages} pages.")
                 
-                if content:
-                    all_content.append(content)
-                else:
-                    print(f"Warning: No content extracted from page {page}")
+                # Create tasks for all pages
+                tasks = [self.get_page(session, page) for page in range(1, self.total_pages + 1)]
                 
-                # Avoid hammering the server
-                time.sleep(self.delay)
+                # Initialize content list with None placeholders
+                results = [None] * self.total_pages
                 
-            return "\n\n===========\n\n".join(all_content)
-            
+                with tqdm(total=self.total_pages, desc="Downloading pages") as pbar:
+                    # Process completed tasks as they come in
+                    for future in asyncio.as_completed(tasks):
+                        page_num, html = await future
+                        if html:
+                            content = self.extract_content_from_html(html)
+                            results[page_num - 1] = content
+                        else:
+                            print(f"Warning: No HTML content for page {page_num}")
+                        pbar.update(1)
+                
+                # Filter out any None values and join content
+                valid_results = [r for r in results if r]
+                return "\n\n===========\n\n".join(valid_results)
+                
         except Exception as e:
             print(f"Error extracting book: {e}")
             return None
@@ -246,27 +252,31 @@ class KetabOnlineExtractor:
             print(f"Error saving to file: {e}")
             return False
     
-    def extract_and_save(self):
+    async def extract_and_save(self):
         """
         Extract the book content and save it to a file
         
         Returns:
             bool: True if successful, False otherwise
         """
-        content = self.extract_book()
+        content = await self.extract_book()
         if content:
             return self.save_to_file(content)
         return False
 
 
 # Main execution
-if __name__ == "__main__":
+async def main():
     print("\n📚 Arabic Book Extractor 📚\n")
     
     # For صيد الخاطر book
     book_id = "1113"
     book_name = "صيد_الخاطر"
+    concurrency = 15  # Number of concurrent requests
     
-    print(f"Extracting book: صيد الخاطر (ID: {book_id})")
-    extractor = KetabOnlineExtractor(book_id, book_name)
-    extractor.extract_and_save() 
+    print(f"Extracting book: صيد الخاطر (ID: {book_id}) with {concurrency} concurrent connections")
+    extractor = KetabOnlineExtractor(book_id, book_name, concurrency=concurrency)
+    await extractor.extract_and_save()
+
+if __name__ == "__main__":
+    asyncio.run(main()) 
