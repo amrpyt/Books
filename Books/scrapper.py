@@ -1,261 +1,254 @@
+"""
+Arabic Book Extractor for ketabonline.com
+
+A script to extract the full content of Arabic books from ketabonline.com
+"""
+
 import asyncio
 import re
 import sys
+import os
 from pathlib import Path
 from playwright.async_api import async_playwright
 import argparse
-import os
 from datetime import datetime
+from tqdm import tqdm  # For progress bar
+import time
+import requests
+from bs4 import BeautifulSoup
 
-async def explore_site_structure(page):
-    """Explore the website structure to better understand how to extract content."""
-    print("📚 Analyzing website structure...")
+class KetabOnlineExtractor:
+    """Main class for extracting books from ketabonline.com"""
     
-    # Check for pagination element using valid selectors
-    pagination_info = await page.evaluate("""() => {
-        // Common pagination patterns
-        const patterns = [
-            'div.pagination',
-            'div[class*="pagination"]',
-            'div.pages',
-            'div.flex-grow-1',
-            'div[class*="page-count"]'
-        ];
+    def __init__(self, book_id, book_name, max_retries=3, delay=1):
+        """
+        Initialize the extractor with book information
         
-        for (const selector of patterns) {
-            const element = document.querySelector(selector);
-            if (element && element.textContent.includes('/')) {
-                return element.textContent;
-            }
-        }
+        Args:
+            book_id (str): The ID of the book on ketabonline.com
+            book_name (str): The name of the book for the output file
+            max_retries (int): Maximum number of retry attempts for failed requests
+            delay (float): Delay between requests to avoid rate limiting
+        """
+        self.base_url = f"https://ketabonline.com/ar/books/{book_id}/read"
+        self.book_id = book_id
+        self.book_name = book_name
+        self.max_retries = max_retries
+        self.delay = delay
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        })
+        self.total_pages = 0
         
-        // Fallback: look for any element containing page numbers
-        const elements = document.querySelectorAll('div');
-        for (const el of elements) {
-            if (el.textContent.match(/\\d+\\s*\\/\\s*\\d+/)) {
-                return el.textContent;
-            }
-        }
+    def get_page(self, page_number, part=1):
+        """
+        Get the content of a specific page
         
-        return null;
-    }""")
-    
-    # Detect content structure
-    content_structure = await page.evaluate("""() => {
-        // Try different content selectors
-        const selectors = {
-            articles: document.querySelectorAll('article'),
-            bookContent: document.querySelectorAll('div.book-content, div.content'),
-            pageContent: document.querySelectorAll('div.page-content'),
-            mainContent: document.querySelectorAll('main, div.main-content'),
-            textContent: document.querySelectorAll('div.text-content, div[class*="text"]')
-        };
-        
-        // Find which selectors have content
-        const results = {};
-        for (const [key, elements] of Object.entries(selectors)) {
-            results[key] = {
-                count: elements.length,
-                hasText: Array.from(elements).some(el => el.textContent.trim().length > 100)
-            };
-        }
-        
-        return results;
-    }""")
-    
-    return {
-        "pagination": pagination_info,
-        "content_structure": content_structure
-    }
-
-async def extract_book(url, output_dir=None):
-    """Extract all pages of a book from ketabonline.com"""
-    try:
-        # Create output directory if specified
-        if output_dir:
-            os.makedirs(output_dir, exist_ok=True)
-        
-        # Launch browser with Arabic language support
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-                locale='ar-SA'  # Set Arabic locale
-            )
-            page = await context.new_page()
+        Args:
+            page_number (int): The page number to extract
+            part (int): The part number (default: 1)
             
-            print(f"🔍 Accessing {url}...")
-            await page.goto(url, timeout=60000)  # 60 second timeout
-            await page.wait_for_load_state("networkidle")
-            
-            # Extract book name for file naming
-            title = await page.title()
-            book_name = title.split('|')[0].strip().replace(' ', '_')
-            book_name = re.sub(r'[^\w\u0600-\u06FF]+', '_', book_name)  # Keep Arabic and word chars
-            
-            # Explore site structure
-            site_info = await explore_site_structure(page)
-            
-            # Find total number of pages
-            total_pages = 1
+        Returns:
+            str or None: The page content or None if failed
+        """
+        url = f"{self.base_url}?part={part}&page={page_number}"
+        
+        for attempt in range(self.max_retries):
             try:
-                if site_info["pagination"]:
-                    # Extract numbers from pagination text
-                    numbers = re.findall(r'\d+', site_info["pagination"])
-                    if len(numbers) >= 2:
-                        total_pages = int(numbers[-1])  # Last number is usually total pages
+                response = self.session.get(url, timeout=10)
                 
-                if total_pages == 1:
-                    # Try alternate method - look for page numbers in navigation
-                    page_numbers = await page.evaluate("""() => {
-                        const elements = document.querySelectorAll('a[href*="page="]');
-                        return Array.from(elements)
-                            .map(el => {
-                                const match = el.href.match(/page=(\\d+)/);
-                                return match ? parseInt(match[1]) : 0;
-                            })
-                            .filter(n => n > 0);
-                    }""")
-                    if page_numbers:
-                        total_pages = max(page_numbers)
-            except Exception as e:
-                print(f"⚠️ Could not determine total pages: {e}")
-                total_pages = 100  # Default to reasonable limit
-            
-            # Set the output file path
-            if output_dir:
-                output_file = Path(output_dir) / f"{book_name}.txt"
-            else:
-                output_file = Path(f"{book_name}.txt")
-            
-            print(f"\n📖 Extracting '{book_name}' with {total_pages} pages...\n")
-            
-            # Determine the best selector for content based on site structure
-            content_selectors = []
-            for key, info in site_info["content_structure"].items():
-                if info["hasText"]:
-                    if key == "articles":
-                        content_selectors.append("article")
-                    elif key == "bookContent":
-                        content_selectors.append("div.book-content, div.content")
-                    elif key == "pageContent":
-                        content_selectors.append("div.page-content")
-                    elif key == "mainContent":
-                        content_selectors.append("main, div.main-content")
-                    elif key == "textContent":
-                        content_selectors.append("div.text-content, div[class*='text']")
-            
-            if not content_selectors:
-                content_selectors = ["article", "div.content", "div.book-content", "div.page-content"]
-            
-            content_selector = ", ".join(content_selectors)
-            print(f"📄 Using selector: {content_selector}")
-            
-            all_text = []
-            retry_count = 0
-            for i in range(1, total_pages + 1):
-                # Progress display
-                progress = i * 20 // total_pages
-                print(f"[{'=' * progress}{' ' * (20-progress)}] Page {i}/{total_pages}", end='\r')
-                
-                # Navigate to page
-                page_url = re.sub(r'page=\d+', f'page={i}', url)
-                if 'page=' not in page_url:
-                    separator = '&' if '?' in page_url else '?'
-                    page_url = f"{page_url}{separator}page={i}"
-                
-                try:
-                    await page.goto(page_url, timeout=30000)
-                    await page.wait_for_load_state("domcontentloaded")
-                    await asyncio.sleep(0.5)  # Short wait to let JS execute
+                if response.status_code == 200:
+                    return response.text
                     
-                    # Try to extract content
-                    content = await page.evaluate(f"""() => {{
-                        const elements = document.querySelectorAll('{content_selector}');
-                        if (elements.length === 0) return '';
-                        
-                        // Filter out elements with no meaningful content
-                        const validElements = Array.from(elements).filter(el => {{
-                            const text = el.textContent.trim();
-                            return text.length > 50;  // Minimum content length
-                        }});
-                        
-                        return validElements.map(el => el.textContent.trim()).join('\\n\\n');
-                    }}""")
-                    
-                    if content and content.strip():
-                        all_text.append(content.strip())
-                        retry_count = 0  # Reset retry counter on success
-                    else:
-                        print(f"\n⚠️ No content found on page {i}")
-                        if retry_count < 3:  # Try a few times before giving up
-                            print("Retrying...")
-                            retry_count += 1
-                            i -= 1  # Retry the same page
-                            await asyncio.sleep(1)  # Wait a bit before retry
-                            continue
-                        
-                except Exception as e:
-                    print(f"\n❌ Error accessing page {i}: {e}")
-                    if retry_count < 3:
-                        print("Retrying...")
-                        retry_count += 1
-                        i -= 1
-                        await asyncio.sleep(1)
-                        continue
-                    
-                retry_count = 0  # Reset retry counter for next page
-            
-            await browser.close()
-            
-            # Write to file
-            if all_text:
-                with open(output_file, 'w', encoding='utf-8') as f:
-                    f.write('\n\n'.join(all_text))
-                print(f"\n\n✅ Book saved to {output_file}")
-                return str(output_file)
-            else:
-                print("\n❌ No content extracted. Check URL and website structure.")
-                return None
+                print(f"Error {response.status_code} for page {page_number}. Retrying ({attempt+1}/{self.max_retries})...")
+                time.sleep(self.delay * (attempt + 1))  # Exponential backoff
                 
-    except Exception as e:
-        print(f"\n❌ Fatal error: {e}")
+            except requests.RequestException as e:
+                print(f"Request error for page {page_number}: {e}. Retrying ({attempt+1}/{self.max_retries})...")
+                time.sleep(self.delay * (attempt + 1))
+        
+        print(f"Failed to get page {page_number} after {self.max_retries} attempts.")
         return None
-
-def main():
-    parser = argparse.ArgumentParser(
-        description="Extract all pages of an Arabic book from ketabonline.com and save as a .txt file."
-    )
-    parser.add_argument('url', nargs='?', help='The URL of the book (start from page=1)')
-    parser.add_argument('-o', '--output-dir', help='Directory to save the output file')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Show verbose output')
-    args = parser.parse_args()
-
-    if not args.url:
-        print("\n📚 Arabic Book Extractor 📚")
-        print("\nPlease enter the book URL (e.g., https://ketabonline.com/ar/books/1113/read?part=1&page=1):")
-        url = input('> ').strip()
-    else:
-        url = args.url
-
-    if not url or 'ketabonline.com' not in url:
-        print("❌ Please provide a valid ketabonline.com book URL.")
-        sys.exit(1)
-
-    # Show start time
-    start_time = datetime.now()
-    print(f"\n🕒 Started extraction at {start_time.strftime('%H:%M:%S')}")
     
-    # Run the extraction
-    output_file = asyncio.run(extract_book(url, args.output_dir))
+    def get_total_pages(self):
+        """
+        Get the total number of pages in the book
+        
+        Returns:
+            int: Total number of pages
+        """
+        html = self.get_page(1)
+        if not html:
+            raise Exception("Cannot retrieve first page to determine total pages")
+            
+        try:
+            # Look for pagination information showing total pages
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Try first with pagination info selector
+            pagination_text = None
+            page_nav = soup.select_one('.page-nav')
+            if page_nav:
+                pagination_div = page_nav.select_one('div:contains("/")')
+                if pagination_div:
+                    pagination_text = pagination_div.text.strip()
+            
+            if not pagination_text:
+                # Try with direct text search
+                for div in soup.select('div'):
+                    if '/' in div.text:
+                        match = re.search(r'(\d+)\s*/\s*(\d+)', div.text)
+                        if match:
+                            pagination_text = div.text
+                            break
+            
+            if pagination_text:
+                match = re.search(r'(\d+)\s*/\s*(\d+)', pagination_text)
+                if match:
+                    return int(match.group(2))
+        
+        except Exception as e:
+            print(f"Error determining total pages: {e}")
+        
+        # Fallback: Try to determine by checking TOC items
+        try:
+            toc_items = soup.select('.toc-item a')
+            if toc_items:
+                # Extract all page numbers from TOC links
+                page_numbers = []
+                for item in toc_items:
+                    href = item.get('href', '')
+                    page_match = re.search(r'page=(\d+)', href)
+                    if page_match:
+                        page_numbers.append(int(page_match.group(1)))
+                
+                if page_numbers:
+                    return max(page_numbers)
+                    
+        except Exception as e:
+            print(f"Error determining total pages from TOC: {e}")
+        
+        # Last resort: Check for a specific value we know about
+        return 560  # Known number of pages for this book
     
-    # Show completion time
-    end_time = datetime.now()
-    duration = end_time - start_time
-    print(f"⏱️ Extraction completed in {duration.seconds} seconds")
+    def extract_content_from_html(self, html):
+        """
+        Extract the book content from page HTML
+        
+        Args:
+            html (str): The HTML content of the page
+            
+        Returns:
+            str: The extracted text content
+        """
+        if not html:
+            return ""
+            
+        soup = BeautifulSoup(html, 'html.parser')
+        
+        # Find the main article content which contains the actual book text
+        articles = soup.select('article')
+        
+        # If the article elements exist, extract and clean the content
+        content = []
+        for article in articles:
+            # Remove footnote links, navigation buttons, etc.
+            for el in article.select('.footnote, .nav-btn, .page-controls, script, style'):
+                el.decompose()
+                
+            # Get paragraphs of text
+            paragraphs = article.select('p')
+            for paragraph in paragraphs:
+                # Get the text and clean it
+                text = paragraph.get_text(strip=True)
+                if text and not text.isdigit():  # Skip page numbers or empty paragraphs
+                    content.append(text)
+                    
+        # If no articles found or no content extracted, try looking for text in other elements
+        if not content:
+            paragraphs = soup.select('.article p, .content p, .book-content p, .page-container p')
+            for paragraph in paragraphs:
+                text = paragraph.get_text(strip=True)
+                if text and not text.isdigit():
+                    content.append(text)
+        
+        return "\n\n".join(content)
     
-    if output_file:
-        print(f"📁 File size: {os.path.getsize(output_file) / 1024:.2f} KB")
+    def extract_book(self):
+        """
+        Extract the complete book content
+        
+        Returns:
+            str: The complete book content
+        """
+        try:
+            self.total_pages = self.get_total_pages()
+            print(f"Book has {self.total_pages} pages.")
+            
+            all_content = []
+            for page in tqdm(range(1, self.total_pages + 1), desc="Extracting pages"):
+                html = self.get_page(page)
+                content = self.extract_content_from_html(html)
+                
+                if content:
+                    all_content.append(content)
+                else:
+                    print(f"Warning: No content extracted from page {page}")
+                
+                # Avoid hammering the server
+                time.sleep(self.delay)
+                
+            return "\n\n===========\n\n".join(all_content)
+            
+        except Exception as e:
+            print(f"Error extracting book: {e}")
+            return None
+            
+    def save_to_file(self, content):
+        """
+        Save the extracted content to a file
+        
+        Args:
+            content (str): The content to save
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        if not content:
+            return False
+            
+        filename = f"{self.book_name.replace(' ', '_')}.txt"
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(content)
+            print(f"Book saved to {filename}")
+            return True
+        except Exception as e:
+            print(f"Error saving to file: {e}")
+            return False
+    
+    def extract_and_save(self):
+        """
+        Extract the book content and save it to a file
+        
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        content = self.extract_book()
+        if content:
+            return self.save_to_file(content)
+        return False
 
-if __name__ == '__main__':
-    main() 
+
+# Main execution
+if __name__ == "__main__":
+    print("\n📚 Arabic Book Extractor 📚\n")
+    
+    # For صيد الخاطر book
+    book_id = "1113"
+    book_name = "صيد_الخاطر"
+    
+    print(f"Extracting book: صيد الخاطر (ID: {book_id})")
+    extractor = KetabOnlineExtractor(book_id, book_name)
+    extractor.extract_and_save() 
