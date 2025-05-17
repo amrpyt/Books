@@ -146,34 +146,52 @@ class KetabOnlineExtractor:
             return ""
             
         soup = BeautifulSoup(html, 'html.parser')
+        content = []
         
-        # Find the main article content which contains the actual book text
+        # The main content is inside article elements nested in the generic container
         articles = soup.select('article')
         
-        # If the article elements exist, extract and clean the content
-        content = []
-        for article in articles:
-            # Remove footnote links, navigation buttons, etc.
-            for el in article.select('.footnote, .nav-btn, .page-controls, script, style'):
-                el.decompose()
+        if articles:
+            for article in articles:
+                # Remove unwanted elements
+                for el in article.select('.footnote, .nav-btn, .page-controls, script, style'):
+                    el.decompose()
                 
-            # Get paragraphs of text
-            paragraphs = article.select('p')
-            for paragraph in paragraphs:
-                # Get the text and clean it
-                text = paragraph.get_text(strip=True)
-                if text and not text.isdigit():  # Skip page numbers or empty paragraphs
-                    content.append(text)
-                    
-        # If no articles found or no content extracted, try looking for text in other elements
+                # Extract text from paragraphs
+                paragraphs = article.select('p')
+                for paragraph in paragraphs:
+                    # Skip elements that only contain references
+                    if paragraph.select_one('a[href^="#"]') and len(paragraph.get_text(strip=True)) < 5:
+                        continue
+                        
+                    # Skip page numbers
+                    text = paragraph.get_text(strip=True)
+                    if text and not re.match(r'^\d+$', text):
+                        # Clean the text - remove page numbers and footnote marks
+                        text = re.sub(r'\d+-', '', text)
+                        content.append(text)
+        
+        # If no content was found with the above method, try more generic selectors
         if not content:
-            paragraphs = soup.select('.article p, .content p, .book-content p, .page-container p')
+            # Try to find article text in any visible paragraph element
+            paragraphs = soup.select('article p, .article-content p, .page-content p')
             for paragraph in paragraphs:
                 text = paragraph.get_text(strip=True)
-                if text and not text.isdigit():
+                if text and not re.match(r'^\d+$', text):
                     content.append(text)
         
-        return "\n\n".join(content)
+        # If still no content, try directly selecting elements that are likely to contain the content
+        if not content:
+            # Look for content in the generic container where the book text is usually located
+            content_container = soup.select_one('.generic')
+            if content_container:
+                paragraphs = content_container.select('p')
+                for paragraph in paragraphs:
+                    text = paragraph.get_text(strip=True)
+                    if text and not re.match(r'^\d+$', text):
+                        content.append(text)
+        
+        return "\n\n".join(content) if content else ""
     
     def extract_book(self):
         """
